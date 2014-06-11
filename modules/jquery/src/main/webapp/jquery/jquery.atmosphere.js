@@ -1177,7 +1177,8 @@ jQuery.atmosphere = function () {
                             _response.messages = [];
                         }
                     } else {
-                        if (!_handleProtocol(_request, message))
+                        message = _handleProtocol(_request, message);
+                        if (message === "")
                             return;
 
                         _response.responseBody = message;
@@ -1277,30 +1278,46 @@ jQuery.atmosphere = function () {
             }
 
             function _handleProtocol(request, message) {
-                // The first messages is always the uuid.
-                var b = true;
-
-                if (request.transport === 'polling') return b;
+                var nMessage = message;
+                if (request.transport === 'polling') return nMessage;
 
                 if (jQuery.trim(message).length !== 0 && request.enableProtocol && request.firstMessage) {
-                    request.firstMessage = false;
+                    var pos = request.trackMessageLength ? 2 : 1;
                     var messages = message.split(request.messageDelimiter);
-                    var pos = messages.length === 2 ? 0 : 1;
+
+                    if (messages.length <= pos + 1) {
+                        // Something went wrong, normally with IE or when a message is written before the
+                        // handshake has been received.
+                        return nMessage;
+                    }
+
+                    request.firstMessage = false;
                     request.uuid = jQuery.trim(messages[pos]);
                     request.stime = jQuery.trim(messages[pos + 1]);
-                    b = false;
+
                     if (request.transport !== 'long-polling') {
                         _triggerOpen(request);
                     }
-
                     jQuery.atmosphere.uuid = request.uuid;
-                } else if (request.enableProtocol && request.firstMessage) {
+                    nMessage = "";
+
+                    // We have trailing messages
+                    pos = request.trackMessageLength ? 4 : 3;
+                    if (messages.length > pos + 1) {
+                        for (var i = pos; i < messages.length; i++) {
+                            nMessage += messages[i];
+                            if (i + 1 !== messages.length) {
+                                nMessage += request.messageDelimiter;
+                            }
+                        }
+                    }
+                } else if (request.enableProtocol && request.firstMessage && jQuery.browser.msie && +jQuery.browser.version.split(".")[0] < 10) {
                     // In case we are getting some junk from IE
-                    b = false;
+                    jQuery.atmosphere.log(_request.logLevel, ["Receiving unexpected data from IE"]);
                 } else {
                     _triggerOpen(request);
                 }
-                return b;
+                return nMessage;
             }
 
             function _timeout(_request) {
@@ -1342,10 +1359,11 @@ jQuery.atmosphere = function () {
              * @param response
              */
             function _trackMessageSize(message, request, response) {
-                if (!_handleProtocol(request, message))
-                    return true;
+                message = _handleProtocol(request, message);
                 if (message.length === 0)
                     return true;
+
+                response.responseBody = message;
 
                 if (request.trackMessageLength) {
                     // prepend partialMessage if any
@@ -1354,7 +1372,7 @@ jQuery.atmosphere = function () {
                     var messages = [];
                     var messageStart = message.indexOf(request.messageDelimiter);
                     while (messageStart !== -1) {
-                        var str = jQuery.trim(message.substring(0, messageStart));
+                        var str = message.substring(0, messageStart);
                         var messageLength = parseInt(str, 10);
                         if (isNaN(messageLength))
                             throw 'message length "' + str + '" is not a number';
@@ -1465,7 +1483,7 @@ jQuery.atmosphere = function () {
                 }
 
                 if (rq.contentType !== '') {
-                    url += "&Content-Type=" + rq.contentType;
+                    url += "&Content-Type=" + (rq.transport === 'websocket' ? rq.contentType : encodeURIComponent(rq.contentType));
                 }
 
                 if (rq.enableProtocol) {
@@ -1518,7 +1536,7 @@ jQuery.atmosphere = function () {
                     return;
                 }
 
-                if (jQuery.browser.msie && jQuery.browser.version < 10) {
+                if (jQuery.browser.msie && +jQuery.browser.version.split(".")[0] < 10) {
                     if ((rq.transport === 'streaming')) {
                         if (rq.enableXDR && window.XDomainRequest) {
                             _ieXDR(rq);
@@ -1596,9 +1614,6 @@ jQuery.atmosphere = function () {
                         var update = false;
 
                         if (rq.transport === 'streaming' && rq.readyState > 2 && ajaxRequest.readyState === 4) {
-                            if (rq.reconnectingOnLength) {
-                                return;
-                            }
                             _clearState();
                             reconnectF();
                             return;
@@ -1637,7 +1652,7 @@ jQuery.atmosphere = function () {
                             var responseText = ajaxRequest.responseText;
                             _response.errorHandled = false;
 
-                            if (jQuery.trim(responseText.length).length === 0 && rq.transport === 'long-polling') {
+                            if (jQuery.trim(responseText).length === 0 && rq.transport === 'long-polling') {
                                 // For browser that aren't support onabort
                                 if (!ajaxRequest.hasData) {
                                     disconnected();
@@ -1682,7 +1697,10 @@ jQuery.atmosphere = function () {
                                                 _invokeCallback();
                                             }
 
-                                            _verifyStreamingLength(ajaxRequest, rq);
+                                            if (_verifyStreamingLength(ajaxRequest, rq)){
+                                                _reconnectOnMaxStreamingLength(ajaxRequest, rq);
+                                                return;
+                                            }
                                         } else if (_response.status > 400) {
                                             // Prevent replaying the last message.
                                             rq.lastIndex = ajaxRequest.responseText.length;
@@ -1693,6 +1711,7 @@ jQuery.atmosphere = function () {
                             } else {
                                 skipCallbackInvocation = _trackMessageSize(responseText, rq, _response);
                             }
+                            var closeStream = _verifyStreamingLength(ajaxRequest, rq);
 
                             try {
                                 _response.status = ajaxRequest.status;
@@ -1709,7 +1728,7 @@ jQuery.atmosphere = function () {
                                 _response.state = "messagePublished";
                             }
 
-                            var isAllowedToReconnect = request.transport !== 'streaming' && request.transport !== 'polling';;
+                            var isAllowedToReconnect = !closeStream && request.transport !== 'streaming' && request.transport !== 'polling';;
                             if (isAllowedToReconnect && !rq.executeCallbackBeforeReconnect) {
                                 _reconnect(ajaxRequest, rq, 0);
                             }
@@ -1721,7 +1740,9 @@ jQuery.atmosphere = function () {
                                 _reconnect(ajaxRequest, rq, 0);
                             }
 
-                            _verifyStreamingLength(ajaxRequest, rq);
+                            if (closeStream) {
+                                _reconnectOnMaxStreamingLength(ajaxRequest, rq);
+                            }
                         }
                     };
 
@@ -1733,6 +1754,12 @@ jQuery.atmosphere = function () {
                     }
                     _onError(0, "maxRequest reached");
                 }
+            }
+
+            function _reconnectOnMaxStreamingLength(ajaxRequest, rq) {
+                _close();
+                _abordingConnection = false;
+                _reconnect(ajaxRequest, rq, 500);
             }
 
             /**
@@ -1763,7 +1790,7 @@ jQuery.atmosphere = function () {
                     }
                 }
 
-                if (_request.withCredentials) {
+                if (_request.withCredentials && _request.transport !== 'websocket') {
                     if ("withCredentials" in ajaxRequest) {
                         ajaxRequest.withCredentials = true;
                     }
@@ -2395,8 +2422,12 @@ jQuery.atmosphere = function () {
                     case "unsubscribe":
                     case "closed":
                         var closed = typeof (_request.closed) !== 'undefined' ? _request.closed : false;
-                        if (typeof (f.onClose) !== 'undefined' && !closed)
-                            f.onClose(response);
+                        if (!closed) {
+                            if (typeof (f.onClose) !== 'undefined') {
+                                f.onClose(response);
+                            }
+                        }
+
                         _request.closed = true;
                         break;
                 }
@@ -2482,14 +2513,9 @@ jQuery.atmosphere = function () {
             function _verifyStreamingLength(ajaxRequest, rq) {
                 // Wait to be sure we have the full message before closing.
                 if (_response.partialMessage === "" && (rq.transport === 'streaming') && (ajaxRequest.responseText.length > rq.maxStreamingLength)) {
-                    _response.messages = [];
-                    rq.reconnectingOnLength = true;
-                    rq.isReopen = true;
-                    _invokeClose(true);
-                    _disconnect();
-                    _clearState();
-                    _reconnect(ajaxRequest, rq, 0);
+                    return true;
                 }
+                return false;
             }
 
             /**
@@ -2664,6 +2690,9 @@ jQuery.atmosphere = function () {
                 request.url = url;
             }
 
+            // https://github.com/Atmosphere/atmosphere-javascript/issues/58
+            jQuery.atmosphere.uuid = ((typeof (request) !== 'undefined') && typeof (request.uuid) !== 'undefined') ? request.uuid : 0;
+
             var rq = new jQuery.atmosphere.AtmosphereRequest(request);
             rq.execute();
 
@@ -2729,9 +2758,9 @@ jQuery.atmosphere = function () {
         },
 
         checkCORSSupport: function () {
-            if (jQuery.browser.msie && !window.XDomainRequest) {
+            if (jQuery.browser.msie && !window.XDomainRequest && +jQuery.browser.version.split(".")[0] < 11) {
                 return true;
-            } else if (jQuery.browser.opera && jQuery.browser.version < 12.0) {
+            } else if (jQuery.browser.opera && +jQuery.browser.version.split(".")[0] < 12.0) {
                 return true;
             }
 
